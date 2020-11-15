@@ -30,7 +30,14 @@ import pymc3 as pm
 
 from pymc3.theanof import floatX
 from . import transforms
-from .distribution import Continuous, Discrete, draw_values, generate_samples, _DrawValuesContext
+from .distribution import (
+    Continuous,
+    Discrete,
+    draw_values,
+    generate_samples,
+    _DrawValuesContext,
+    is_fast_drawable,
+)
 from ..model import Deterministic
 from .continuous import ChiSquared, Normal
 from .special import gammaln, multigammaln
@@ -255,56 +262,53 @@ class MvNormal(_QuadFormBase):
         -------
         array
         """
-        if size is None:
-            size = tuple()
+        size = to_tuple(size)
+
+        param_attribute = "chol_cov" if self._cov_type == "chol" else self._cov_type
+        mu, param = draw_values([self.mu, getattr(self, param_attribute)], point=point, size=size)
+        if tuple(self.shape):
+            dist_shape = tuple(self.shape)
         else:
-            if not isinstance(size, tuple):
-                try:
-                    size = tuple(size)
-                except TypeError:
-                    size = (size,)
+            if is_fast_drawable(self.mu) or point:
+                batch_shape = mu.shape[:-1]
+            else:
+                batch_shape = mu.shape[len(size) : -1]
+            dist_shape = batch_shape + param.shape[-1:]
+
+        # First, distribution shape (batch+event) is computed and then
+        # deterministic nature of random method can be obtained by appending it to sample_shape.
+        output_shape = size + dist_shape
+        extra_dims = len(output_shape) - mu.ndim
+
+        # It was not a good idea to check mu.shape[:len(size)] == size,
+        # because it can get mixed among batch and event dimensions. Here, we explicitly chop off
+        # the size (sample_shape) and only broadcast batch and event dimensions.
+        if is_fast_drawable(self.mu) or point:
+            mu = mu.reshape((1,) * extra_dims + mu.shape)
+        else:
+            mu = mu.reshape(size + (1,) * extra_dims + mu.shape[len(size) :])
+
+        mu = np.broadcast_to(mu, output_shape)
+
+        if mu.shape[-1] != param.shape[-1]:
+            raise ValueError(f"Shapes for mu and {self._cov_type} don't match")
 
         if self._cov_type == "cov":
-            mu, cov = draw_values([self.mu, self.cov], point=point, size=size)
-            if mu.shape[-1] != cov.shape[-1]:
-                raise ValueError("Shapes for mu and cov don't match")
-
-            try:
-                dist = stats.multivariate_normal(mean=mu, cov=cov, allow_singular=True)
-            except ValueError:
-                size += (mu.shape[-1],)
-                return np.nan * np.zeros(size)
-            return dist.rvs(size)
-        elif self._cov_type == "chol":
-            mu, chol = draw_values([self.mu, self.chol_cov], point=point, size=size)
-            if size and mu.ndim == len(size) and mu.shape == size:
-                mu = mu[..., np.newaxis]
-            if mu.shape[-1] != chol.shape[-1] and mu.shape[-1] != 1:
-                raise ValueError("Shapes for mu and chol don't match")
-            broadcast_shape = np.broadcast(np.empty(mu.shape[:-1]), np.empty(chol.shape[:-2])).shape
-
-            mu = np.broadcast_to(mu, broadcast_shape + (chol.shape[-1],))
-            chol = np.broadcast_to(chol, broadcast_shape + chol.shape[-2:])
-            # If mu and chol were fixed by the point, only the standard normal
-            # should change
-            if mu.shape[: len(size)] != size:
-                std_norm_shape = size + mu.shape
-            else:
-                std_norm_shape = mu.shape
-            standard_normal = np.random.standard_normal(std_norm_shape)
+            # Calculate mu + L * samples, L = chol(cov)
+            chol = linalg.cholesky(param, lower=True)
+            standard_normal = np.random.standard_normal(output_shape)
             return mu + np.einsum("...ij,...j->...i", chol, standard_normal)
+        elif self._cov_type == "chol":
+            standard_normal = np.random.standard_normal(output_shape)
+            return mu + np.einsum("...ij,...j->...i", param, standard_normal)
         else:
-            mu, tau = draw_values([self.mu, self.tau], point=point, size=size)
-            if mu.shape[-1] != tau[0].shape[-1]:
-                raise ValueError("Shapes for mu and tau don't match")
-
-            size += (mu.shape[-1],)
+            # Calculate mu + L^{-T} * samples, L = chol(tau)
             try:
-                chol = linalg.cholesky(tau, lower=True)
+                chol = linalg.cholesky(param, lower=True)
             except linalg.LinAlgError:
-                return np.nan * np.zeros(size)
+                return np.nan * np.zeros(output_shape)
 
-            standard_normal = np.random.standard_normal(size)
+            standard_normal = np.random.standard_normal(output_shape)
             transformed = linalg.solve_triangular(chol, standard_normal.T, lower=True)
             return mu + transformed.T
 
